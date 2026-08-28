@@ -1,0 +1,45 @@
+@baseUrl = http://localhost:8080
+@accountId = replace-with-account-id
+
+### Health check
+GET {{baseUrl}}/actuator/health
+
+### Create an account
+POST {{baseUrl}}/api/v1/accounts
+Content-Type: application/json
+
+{
+  "customerId": "customer-123",
+  "country": "EE",
+  "currencies": ["EUR", "USD"]
+}
+
+### Get an account
+GET {{baseUrl}}/api/v1/accounts/{{accountId}}
+
+### Create an incoming transaction
+POST {{baseUrl}}/api/v1/transactions
+Content-Type: application/json
+
+{
+  "accountId": "{{accountId}}",
+  "amount": 100.00,
+  "currency": "EUR",
+  "direction": "IN",
+  "description": "Initial deposit"
+}
+
+### Create an outgoing transaction
+POST {{baseUrl}}/api/v1/transactions
+Content-Type: application/json
+
+{
+  "accountId": "{{accountId}}",
+  "amount": 25.00,
+  "currency": "EUR",
+  "direction": "OUT",
+  "description": "Card purchase"
+}
+
+### Get transaction history
+GET {{baseUrl}}/api/v1/transactions?accountId={{accountId}}

@@ -2,9 +2,8 @@ package ee.tuum.banking;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
-import ee.tuum.banking.messaging.OutboxMapper;
-import ee.tuum.banking.messaging.OutboxPublisher;
-import ee.tuum.banking.messaging.RabbitConfiguration;
+import ee.tuum.banking.outbox.mapper.OutboxMapper;
+import ee.tuum.banking.outbox.OutboxPublisher;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.springframework.amqp.core.Binding;

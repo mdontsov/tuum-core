@@ -1,145 +1,215 @@
 # Core Banking Service
 
-A small account and transaction service built with Java 17, Spring Boot, MyBatis,
-PostgreSQL, RabbitMQ, Gradle and JUnit 5.
+This is a small account and transaction service built with Java 21, Spring Boot,
+MyBatis, PostgreSQL and RabbitMQ. It supports accounts in multiple currencies,
+keeps a transaction history and publishes every business change as an event.
 
-## Run the application
+## Running the application
 
-The only prerequisite is a running Docker engine. No Java, Gradle, database,
-message broker or `PATH` change is required.
+Docker is the only prerequisite. The repository includes the application, database
+and RabbitMQ configuration, so there is no need to install Java or Gradle or change
+the system `PATH`.
+
+Start the complete stack from the repository root:
 
 ```shell
 docker compose up --build
 ```
 
-Wait until the `app` container is healthy. The services are then available at:
+Once the `app` container is healthy, the following endpoints are available:
 
 - REST API: `http://localhost:8080`
-- Health: `http://localhost:8080/actuator/health`
+- Health check: `http://localhost:8080/actuator/health`
 - RabbitMQ management: `http://localhost:15672` (`banking` / `banking`)
 - PostgreSQL: `localhost:5432` (`banking` / `banking`)
 
-Stop the application with `docker compose down`. To also remove local database
-data, run `docker compose down --volumes`.
-
-## API
-
-Create an account:
+The application logs an entry after RabbitMQ confirms each published event. The
+entry contains the event ID, event type, routing key and JSON payload. To follow
+these messages while using the API, run:
 
 ```shell
-curl -i -X POST http://localhost:8080/api/v1/accounts \
-  -H "Content-Type: application/json" \
-  -d '{"customerId":"customer-123","country":"EE","currencies":["EUR","USD"]}'
+docker compose logs -f app
 ```
 
-Get an account:
+Stop the containers with:
 
 ```shell
-curl http://localhost:8080/api/v1/accounts/ACCOUNT_ID
+docker compose down
 ```
 
-Create a transaction:
+PostgreSQL data is kept in a Docker volume. Use the following command when a clean
+database is needed:
 
 ```shell
-curl -i -X POST http://localhost:8080/api/v1/transactions \
-  -H "Content-Type: application/json" \
-  -d '{"accountId":"ACCOUNT_ID","amount":100.00,"currency":"EUR","direction":"IN","description":"Deposit"}'
+docker compose down --volumes
 ```
 
-Get transactions:
+All commands above work the same way on Windows, macOS and Linux.
+
+## Trying the API
+
+The examples are written as raw HTTP, so they are not tied to a particular shell or
+operating system. They can be sent from IntelliJ HTTP Client, VS Code REST Client,
+Postman, Insomnia or any similar tool. Ready-to-run copies are also provided in
+[`api-requests.http`](api-requests.http).
+
+### Create an account
+
+```http
+POST http://localhost:8080/api/v1/accounts
+Content-Type: application/json
+
+{
+  "customerId": "customer-123",
+  "country": "EE",
+  "currencies": ["EUR", "USD"]
+}
+```
+
+The response contains the new account ID and one zero-valued balance for every
+requested currency. Supported currencies are `EUR`, `SEK`, `GBP` and `USD`.
+
+### Get an account
+
+Replace `ACCOUNT_ID` with the ID returned by the create request.
+
+```http
+GET http://localhost:8080/api/v1/accounts/ACCOUNT_ID
+```
+
+### Create a transaction
+
+```http
+POST http://localhost:8080/api/v1/transactions
+Content-Type: application/json
+
+{
+  "accountId": "ACCOUNT_ID",
+  "amount": 100.00,
+  "currency": "EUR",
+  "direction": "IN",
+  "description": "Deposit"
+}
+```
+
+`IN` adds to the balance and `OUT` subtracts from it. Amounts must be positive and
+may have up to four decimal places. An outgoing transaction is rejected when the
+account does not have enough money in that currency.
+
+### Get transaction history
+
+```http
+GET http://localhost:8080/api/v1/transactions?accountId=ACCOUNT_ID
+```
+
+Validation and business errors are returned as RFC 9457 Problem Details. Each error
+also has a stable `code` field that clients can use without parsing its message.
+
+## Building and testing
+
+To build the application image without starting the stack, run:
 
 ```shell
-curl "http://localhost:8080/api/v1/transactions?accountId=ACCOUNT_ID"
+docker compose build app
 ```
 
-Supported currencies are `EUR`, `SEK`, `GBP` and `USD`; directions are `IN`
-and `OUT`. Amounts must be positive and may have at most four decimal places.
-Errors use RFC 9457 Problem Details and include a stable `code` property.
+The integration tests use Testcontainers with real PostgreSQL and RabbitMQ
+instances. They cover request validation, persistence, balance changes, concurrent
+withdrawals, outbox processing and RabbitMQ delivery. JaCoCo checks that instruction
+coverage stays above 80%.
 
-## Build and test
+The GitHub Actions workflow runs the full Gradle test suite, verifies coverage and
+builds the Docker image on every push and pull request. Its HTML test and coverage
+reports are available from the workflow run as the `verification-reports` artifact.
 
-The Gradle Wrapper is committed, so a local Java 17+ installation is sufficient:
+## Design
 
-```shell
-./gradlew clean check
-```
+I kept the solution as a modular monolith. Accounts, transactions and messaging are
+separated in the code, but they run in one application and use one database. For
+this scope, separate account and transaction services would add network calls,
+eventual consistency and compensation logic without a practical benefit.
 
-On Windows:
+PostgreSQL is the source of truth for accounts, balances and transaction history.
+When a transaction is created, the service locks the balance row for the requested
+account and currency with `SELECT FOR UPDATE`. It then checks the funds, changes the
+balance, inserts the transaction and records the related events in one database
+transaction. This prevents concurrent withdrawals from overspending an account,
+while operations on unrelated balances can still proceed independently.
 
-```powershell
-.\gradlew.bat clean check
-```
+Amounts are represented by `BigDecimal` in Java and `NUMERIC(19,4)` in PostgreSQL.
+Identifiers are UUIDs, and Flyway creates and updates the database schema. MyBatis
+Dynamic SQL keeps the queries explicit, including the locking behaviour.
 
-Integration tests use Testcontainers and therefore require Docker. They start real
-PostgreSQL and RabbitMQ instances and cover REST validation, persistence, balance
-changes, concurrent withdrawals, the transactional outbox and actual RabbitMQ
-delivery. JaCoCo enforces at least 80% instruction coverage during `check`; the HTML
-report is written to `build/reports/jacoco/test/html/index.html`.
+### RabbitMQ and the transactional outbox
 
-## Architecture and important choices
+Publishing directly to RabbitMQ inside a database transaction can leave the two
+systems out of sync. Instead, each account, balance or transaction change writes an
+event to the `outbox_events` table as part of the same commit as the business data.
 
-This is a modular monolith. Accounts, balances, transactions and messaging have
-separate packages, but they share one process and consistency boundary. Splitting
-balance ownership and transaction creation between services would require a saga,
-compensation logic and eventual consistency without providing value at this scale.
-
-Every balance change and ledger entry is committed atomically. Transaction creation
-locks the affected `(account_id, currency)` balance row with `SELECT FOR UPDATE`,
-checks available funds, updates the balance, inserts an immutable ledger entry and
-inserts outbox records in one PostgreSQL transaction. Consequently, concurrent
-withdrawals cannot overdraw a balance, while different balances proceed independently.
-
-Money uses Java `BigDecimal` and PostgreSQL `NUMERIC(19,4)`. UUIDs avoid a central ID
-generator. Flyway owns schema initialization, and MyBatis XML keeps locking and SQL
-behavior explicit.
-
-Business mutations create domain events in `outbox_events` in the same database
-transaction. A scheduled publisher claims events with `FOR UPDATE SKIP LOCKED`, sends
-persistent JSON messages to the durable `account.events` topic exchange, waits for a
-RabbitMQ publisher confirmation, then marks them published. Routing keys are:
+A scheduled publisher reads pending events with `FOR UPDATE SKIP LOCKED`, sends
+them as persistent JSON messages to the durable `account.events` topic exchange,
+waits for publisher confirmation and then marks them as published. The available
+routing keys are:
 
 - `account.created`
 - `balance.created`
 - `balance.updated`
 - `transaction.created`
 
-Delivery is at least once. Every message carries stable `eventId`, `eventType`,
-`aggregateType` and `aggregateId` headers, so consumers can deduplicate by event ID.
+Delivery is at least once, so every message includes stable `eventId`, `eventType`,
+`aggregateType` and `aggregateId` headers. Consumers can use the event ID to ignore
+a duplicate delivery.
 
-## Performance estimate
+## Performance
 
-The included k6 workload gives every virtual user its own account, avoiding an
-artificial single-account lock bottleneck. With the application already running:
+A k6 workload is included in the `performance` Docker Compose profile. Each virtual
+user works with a separate account, which avoids turning the test into a benchmark
+of a single locked balance row. With the application running, start it with:
 
 ```shell
 docker compose --profile performance run --rm k6
 ```
 
-A conservative pre-benchmark estimate for a typical 8-core development laptop is
-**300–700 committed transactions per second**, including four PostgreSQL writes
-(balance, transaction and two outbox records) per request. This is an estimate, not
-a measured claim for the reviewer's hardware. The reproducible k6 result—request
-rate, error rate, and p95 latency—is the authoritative figure. A workload focused on
-one account/currency will be much lower by design because those mutations must be
-serialized to preserve financial correctness.
+On my development machine—an AMD Ryzen 9 5950X with 64 GB RAM and roughly 31 GB
+assigned to Docker Desktop—the 60-second test used 40 virtual users and produced:
 
-## Horizontal scaling considerations
+- 235,254 completed transaction requests
+- about **3,743 requests per second**
+- no failed requests
+- 10.56 ms average response time and 18.04 ms p95 response time
 
-The HTTP application is stateless and can run in multiple replicas. PostgreSQL is
-the source of truth; row locking preserves balance correctness across replicas.
-Outbox publishers use `SKIP LOCKED`, allowing replicas to share publication work.
-RabbitMQ consumers must be idempotent because delivery is at least once.
+That figure shows how quickly the API and database can accept a short burst; it is
+not the sustainable end-to-end rate. Each transaction creates two outbox events,
+and the single publisher processed about 170 events per second during the same test.
+Without allowing the outbox backlog to grow continuously, the current application
+therefore handles approximately **80–90 transactions per second end to end**.
 
-At larger scale, size the total connection pool across replicas, monitor lock waits
-and outbox lag, apply back-pressure, and partition or archive the transaction and
-outbox tables. Read replicas can serve history queries. If write volume outgrows one
-database, accounts can be sharded by account ID, but a single account's ordered
-balance mutations should remain in one consistency boundary. Migrations must run
-with Flyway locking, and production deployments need metrics, tracing, centralized
-logs, readiness checks and graceful shutdown.
+Results will vary with hardware, Docker limits, database contents, logging and
+RabbitMQ settings. A test that repeatedly updates one account will also be slower,
+because changes to the same balance must be serialized for correctness.
 
-## Repository handover
+## Horizontal scaling
 
-Commit this directory to an accessible GitHub or GitLab repository and grant the
-reviewers access. The repository should include all files currently present; no
-credentials beyond the local Docker development defaults are required.
+The application does not keep session state, so multiple instances can run behind a
+load balancer. They can share PostgreSQL safely because balance correctness is
+enforced by database row locks. The outbox query uses `SKIP LOCKED`, which also lets
+publishers on several instances divide pending work without blocking one another.
+
+The local test showed that outbox publication is the first part that needs attention.
+I would start by publishing in batches, adding publisher workers and tuning the
+polling delay. The important operational signals are the number of unpublished
+events and the age of the oldest one. If a consumer relies on per-account ordering,
+that guarantee also needs to be maintained when publication is parallelized.
+
+More application instances mean more database connections, so pool sizes must be
+planned across the whole deployment. RabbitMQ consumers must also be idempotent
+because at-least-once delivery can produce duplicates. At higher volumes, old
+transaction and outbox data can be archived or partitioned, while read replicas can
+serve transaction-history queries. Sharding by account ID is an option if one
+database eventually becomes the write bottleneck, but every balance change for a
+given account should stay within one database transaction boundary.
+
+## Usage of AI
+
+Codex CLI has been a great help for understanding and integrating MyBatis and RabbitMQ components
+mainly because I haven't had any previous work experience with those
